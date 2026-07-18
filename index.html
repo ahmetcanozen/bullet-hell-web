@@ -115,6 +115,99 @@ const GODOT_CONFIG = {"args":[],"canvasResizePolicy":2,"emscriptenPoolSize":8,"e
 const GODOT_THREADS_ENABLED = false;
 const engine = new Engine(GODOT_CONFIG);
 
+// Godot 4.6 emscripten: timing mode 0 = setTimeout, 1 = requestAnimationFrame.
+// Inactive browser tabs stop rAF — switch to setTimeout so multiplayer host keeps simulating.
+function installBackgroundKeepAlive(engineInstance) {
+	const HIDDEN_TICK_MS = 33;
+	let silentAudioCtx = null;
+	let wakeLock = null;
+
+	function ensureSilentAudio() {
+		if (silentAudioCtx || typeof AudioContext === 'undefined') {
+			return;
+		}
+		try {
+			silentAudioCtx = new AudioContext();
+			const osc = silentAudioCtx.createOscillator();
+			const gain = silentAudioCtx.createGain();
+			gain.gain.value = 0.0001;
+			osc.connect(gain);
+			gain.connect(silentAudioCtx.destination);
+			osc.start(0);
+		} catch (err) {
+			console.warn('Background audio keepalive unavailable:', err);
+		}
+	}
+
+	function releaseSilentAudio() {
+		if (!silentAudioCtx) {
+			return;
+		}
+		try {
+			silentAudioCtx.close();
+		} catch (err) {}
+		silentAudioCtx = null;
+	}
+
+	async function requestWakeLock() {
+		if (!('wakeLock' in navigator)) {
+			return;
+		}
+		try {
+			wakeLock = await navigator.wakeLock.request('screen');
+			wakeLock.addEventListener('release', () => { wakeLock = null; });
+		} catch (err) {}
+	}
+
+	async function reacquireWakeLock() {
+		if (document.hidden || wakeLock) {
+			return;
+		}
+		await requestWakeLock();
+	}
+
+	function kickMainLoop() {
+		const mod = engineInstance.rtenv;
+		if (!mod || !mod.MainLoop || typeof mod._emscripten_set_main_loop_timing !== 'function') {
+			return;
+		}
+		if (typeof mod.resumeMainLoop === 'function') {
+			try { mod.resumeMainLoop(); } catch (err) {}
+		}
+		if (typeof mod.MainLoop.scheduler === 'function') {
+			try { mod.MainLoop.scheduler(); } catch (err) {}
+		}
+	}
+
+	function setBackgroundMode(hidden) {
+		const mod = engineInstance.rtenv;
+		if (!mod || typeof mod._emscripten_set_main_loop_timing !== 'function') {
+			return;
+		}
+		if (hidden) {
+			ensureSilentAudio();
+			mod._emscripten_set_main_loop_timing(0, HIDDEN_TICK_MS);
+		} else {
+			mod._emscripten_set_main_loop_timing(1, 1);
+			releaseSilentAudio();
+			reacquireWakeLock();
+		}
+		kickMainLoop();
+	}
+
+	document.addEventListener('visibilitychange', () => {
+		setBackgroundMode(document.hidden);
+	});
+
+	document.addEventListener('visibilitychange', () => {
+		if (!document.hidden) {
+			reacquireWakeLock();
+		}
+	});
+
+	requestWakeLock();
+}
+
 (function () {
 	const statusOverlay = document.getElementById('status');
 	const statusProgress = document.getElementById('status-progress');
@@ -211,6 +304,7 @@ const engine = new Engine(GODOT_CONFIG);
 			},
 		}).then(() => {
 			setStatusMode('hidden');
+			installBackgroundKeepAlive(engine);
 		}, displayFailureNotice);
 	}
 }());
